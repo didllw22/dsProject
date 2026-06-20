@@ -18,7 +18,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 st.set_page_config(
-    page_title="세대 간 자산 형성 디커플링 분석",
+    page_title="세대 간 자산 형성 나홀로 집값 분석",
     page_icon="🏙️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -285,7 +285,7 @@ def load_pir_data(price_df, wage_df, area=84):
 #  예측 모델
 # ════════════════════════════════════════════════
 
-def forecast_poly(years_float, values, target_year=2044, degree=2):
+def forecast_poly(years_float, values, target_year=2044, degree=2, add_cycle=False, only_noise=False):
     """2차 다항 회귀 예측. years_float = float 형태의 연도 리스트"""
     X = np.array(years_float).reshape(-1, 1)
     y = np.array(values, dtype=float)
@@ -297,6 +297,60 @@ def forecast_poly(years_float, values, target_year=2044, degree=2):
     future_floats = np.arange(years_float[-1] + 1/12, target_year + 1, 1/12)
     fut_vals      = model.predict(poly.transform(future_floats.reshape(-1, 1)))
     target_val    = model.predict(poly.transform([[target_year]]))[0]
+
+    if add_cycle:
+        # ── 데이터 기반 사이클 및 위상 자동 추정 ──
+        hist_trend = model.predict(Xp).flatten()
+        y_flat = y.flatten()
+        rel_res = (y_flat - hist_trend) / hist_trend
+        
+        # 진폭(Amplitude) 추정 (RMS 기반)
+        auto_amp_pct = np.clip(np.std(rel_res) * np.sqrt(2), 0.02, 0.30)
+        
+        # 주기(Period) 추정 (이동평균 영점 교차)
+        import pandas as pd
+        s_res = pd.Series(rel_res).rolling(12, center=True, min_periods=1).mean().values
+        zero_crossings = np.where(np.diff(np.sign(s_res)))[0]
+        if len(zero_crossings) >= 2:
+            avg_cross_dist = np.mean(np.diff(zero_crossings)) # 반주기(개월)
+            auto_period_years = np.clip((avg_cross_dist * 2) / 12.0, 3.0, 15.0)
+        else:
+            auto_period_years = 8.0
+            
+        # 현재 위상(Phase) 추정 (현재 상승장인지 하락장인지 매끄럽게 연결)
+        current_rel = s_res[-1]
+        prev_rel    = s_res[-2] if len(s_res) > 1 else 0
+        phi = np.arcsin(np.clip(current_rel / auto_amp_pct, -0.99, 0.99))
+        if current_rel < prev_rel: # 하락 구간
+            phi = np.pi - phi
+            
+        current_year = years_float[-1]
+        base_amplitude = values[-1] * auto_amp_pct
+        
+        # 1. 거시적 사이클 파동
+        if only_noise:
+            cycle_wave = 0
+            target_cycle = 0
+        else:
+            cycle_wave = base_amplitude * np.sin(2 * np.pi * (future_floats - current_year) / auto_period_years + phi)
+            target_cycle = base_amplitude * np.sin(2 * np.pi * (target_year - current_year) / auto_period_years + phi)
+        
+        # 2. 미시적 무작위 변동성 (실제 데이터와 같은 질감 부여)
+        np.random.seed(int(target_year) + int(y_flat[0])) # 변수별로 다른 패턴
+        hist_pct_change = np.diff(y_flat) / y_flat[:-1]
+        volatility = np.std(hist_pct_change)
+        
+        noise = np.zeros(len(future_floats))
+        noise[0] = np.random.normal(0, volatility * 0.5)
+        for i in range(1, len(future_floats)):
+            noise[i] = 0.9 * noise[i-1] + np.random.normal(0, volatility * 0.4)
+            
+        noise_wave = fut_vals.flatten() * noise
+        
+        # 예측값에 사이클과 노이즈 반영
+        fut_vals = fut_vals.flatten() + cycle_wave + noise_wave
+        target_noise = target_val * np.random.normal(0, volatility)
+        target_val = target_val + target_cycle + target_noise
 
     # 연결용 (마지막 실제값 포함)
     conn_floats = np.concatenate([[years_float[-1]], future_floats])
@@ -354,7 +408,7 @@ def forecast_backtest(years_float, values, test_years=3, degree=2):
 # ════════════════════════════════════════════════
 
 with st.sidebar:
-    st.markdown("## 🏙️ 디커플링 분석")
+    st.markdown("## 🏙️ 나홀로 집값 분석")
     st.markdown("**세대 간 자산 형성 구조 변화**")
     st.markdown("---")
     st.markdown("### ⚙️ 분석 설정")
@@ -381,7 +435,13 @@ with st.sidebar:
 
     selected_region = st.selectbox("분석 지역", REGION_LIST, index=6)
     target_year     = st.slider("예측 목표 연도", 2030, 2050, 2044, step=1)
-    area            = st.selectbox("아파트 면적 (㎡)", [20, 33, 49, 59, 74, 84, 99, 114, 132, 150, 180, 220], index=5)
+    area            = st.selectbox(
+        "아파트 면적", 
+        [20, 33, 49, 59, 74, 84, 99, 114, 132, 150, 180, 220], 
+        index=5, 
+        format_func=lambda x: f"{x}㎡ (약 {int(x / 3.3058)}평)"
+    )
+    area_str        = f"{area}㎡(약 {int(area/3.3058)}평)"
     pir_target      = st.slider("목표 PIR (사회적 합의)", 8, 20, 12)
 
     st.markdown("---")
@@ -390,6 +450,15 @@ with st.sidebar:
     ltv        = st.slider("LTV (%)", 40, 80, 60) / 100
     loan_rate  = st.slider("대출 금리 (%)", 2.0, 8.0, 4.5, step=0.1) / 100
     loan_years = st.selectbox("대출 기간 (년)", [10, 15, 20, 25, 30, 35, 40, 45, 50], index=4)
+
+    st.markdown("---")
+    st.markdown("### 💰 나의 자산 설정")
+    my_asset = st.number_input("현재 보유 자산 (만원)", min_value=0, value=5000, step=1000)
+    my_savings = st.number_input("월 저축 가능액 (만원)", min_value=0, value=150, step=10)
+
+    st.markdown("---")
+    st.markdown("### 🌊 부동산 시뮬레이션 (데이터 기반 자동 분석)")
+    use_cycle = st.checkbox("과거 추세 기반 사이클/노이즈 자동 반영", value=True, help="과거 실거래가의 등락폭과 주기를 분석하여 미래 예측에 자동으로 적용합니다.")
 
     st.markdown("---")
     st.markdown("**📊 데이터 출처**")
@@ -436,9 +505,15 @@ num_years_wage  = (len(wage_df)  - 1) / 12.0
 price_cagr = ((price_vals[-1] / price_vals[0]) ** (1 / num_years_price) - 1) * 100
 wage_cagr  = ((wage_annual_vals[-1] / wage_annual_vals[0]) ** (1 / num_years_wage) - 1) * 100
 
-# 예측
-pred_price_manwon, fut_fp, fut_vp, conn_fp, conn_vp = forecast_poly(price_floats, price_vals,       target_year)
-pred_wage_manwon,  fut_fw, fut_vw, conn_fw, conn_vw = forecast_poly(wage_floats,  wage_annual_vals, target_year)
+# 예측 (집값은 과거 데이터 기반 사이클 자동 적용)
+pred_price_manwon, fut_fp, fut_vp, conn_fp, conn_vp = forecast_poly(
+    price_floats, price_vals, target_year, 
+    add_cycle=use_cycle
+)
+pred_wage_manwon,  fut_fw, fut_vw, conn_fw, conn_vw = forecast_poly(
+    wage_floats, wage_annual_vals, target_year,
+    add_cycle=use_cycle, only_noise=True # 임금은 거시 사이클 파동 없이 미시 노이즈만 반영
+)
 
 # 미래 날짜 문자열
 fut_fp_str   = [float_to_date_str(y) for y in fut_fp]
@@ -485,10 +560,10 @@ if selected_region not in st.session_state.selected_chart_regions:
 #  헤더
 # ════════════════════════════════════════════════
 
-st.markdown('<div class="main-title">🏙️ 세대 간 자산 형성 디커플링 분석</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">🏙️ 세대 간 자산 형성 나홀로 집값 분석</div>', unsafe_allow_html=True)
 st.markdown(
     f'<div class="sub-title">근로소득과 부동산 자산의 격차 분석 및 {target_year}년 미래 적정 소득 예측 모델링 | '
-    f'월별 실거래 데이터 기반 · {selected_region} · {area}㎡</div>',
+    f'월별 실거래 데이터 기반 · {selected_region} · {area_str}</div>',
     unsafe_allow_html=True
 )
 
@@ -498,12 +573,12 @@ with col1:
     st.markdown(f"""<div class="metric-card">
         <div class="metric-value">{income_result['필요연소득_만원']:,}만원</div>
         <div class="metric-label">{target_year}년 필요 연소득 (DSR {dsr_pct}%)</div>
-        <div class="metric-sub">{selected_region} · {area}㎡ 기준</div>
+        <div class="metric-sub">{selected_region} · {area_str} 기준</div>
     </div>""", unsafe_allow_html=True)
 with col2:
     st.markdown(f"""<div class="metric-card">
         <div class="metric-value">{pred_price_eok:.1f}억원</div>
-        <div class="metric-label">{target_year}년 예상 아파트가 ({area}㎡)</div>
+        <div class="metric-label">{target_year}년 예상 아파트가 ({area_str})</div>
         <div class="metric-sub">{selected_region} 기준</div>
     </div>""", unsafe_allow_html=True)
 with col3:
@@ -530,7 +605,7 @@ if "active_section" not in st.session_state:
 
 SECTIONS = [
     {"id": "trend",      "icon": "📈", "title": "시계열 추세",    "metric": f"{price_cagr:.1f}%",         "metric_label": f"주택가격 CAGR ({num_years_price:.0f}년)",  "desc": "지역별 아파트 매매가 추이와 임금 상승률을 월 단위로 비교합니다."},
-    {"id": "decoupling", "icon": "🔍", "title": "디커플링 분석",  "metric": f"{current_pir:.1f}배",        "metric_label": f"현재 PIR ({selected_region})",             "desc": "소득-자산 격차를 수치화하고 전국 PIR 추이를 분석합니다."},
+    {"id": "decoupling", "icon": "🔍", "title": "나홀로 집값 분석",  "metric": f"{current_pir:.1f}배",        "metric_label": f"현재 PIR ({selected_region})",             "desc": "소득-자산 격차를 수치화하고 전국 PIR 추이를 분석합니다."},
     {"id": "forecast",   "icon": "🔮", "title": "미래 예측",      "metric": f"{pred_price_eok:.1f}억",     "metric_label": f"{target_year}년 예상 매매가",              "desc": "월별 다항 회귀 모델로 미래 가격과 임금을 예측합니다."},
     {"id": "income",     "icon": "💰", "title": "적정 소득 산출", "metric": f"{lack_ratio}배",             "metric_label": "소득 부족 배율",                           "desc": "PIR / DSR 기준 미래 필요 소득과 자기자본을 산출합니다."},
     {"id": "scenario",   "icon": "📊", "title": "시나리오 분석",  "metric": "3가지",                       "metric_label": "성장률 시나리오",                          "desc": "비관·표준·낙관 시나리오별 민감도를 분석합니다."},
@@ -798,7 +873,7 @@ else:
         col_a, col_b, col_c = st.columns(3)
         col_a.metric(f"주택가격 CAGR ({num_years_price:.0f}년)", f"{price_cagr:.2f}%")
         col_b.metric(f"임금 CAGR ({num_years_wage:.0f}년)",     f"{wage_cagr:.2f}%")
-        col_c.metric("디커플링 배율", f"{price_cagr/wage_cagr:.1f}x",
+        col_c.metric("나홀로 집값 배율", f"{price_cagr/wage_cagr:.1f}x",
                      delta=f"+{price_cagr - wage_cagr:.2f}%p 격차")
 
 
@@ -806,7 +881,7 @@ else:
     elif _active == "forecast":
         st.markdown(f'<div class="section-header">{selected_region} — {target_year}년까지 예측 (월별 2차 다항 회귀)</div>', unsafe_allow_html=True)
         st.markdown("""<div class="info-box">📌 <b>차트 읽는 법</b>: 실선 = 실제 데이터 · 점선 = 회귀 예측 · 두 선은 마지막 실제값에서 자연스럽게 연결됩니다.<br>
-        자산 가격과 근로 소득의 디커플링(괴리)을 직관적으로 확인하기 위해 <b>이중 Y축 통합 차트</b>로 제공됩니다.<br>
+        자산 가격과 근로 소득의 나홀로 집값(괴리)을 직관적으로 확인하기 위해 <b>이중 Y축 통합 차트</b>로 제공됩니다.<br>
         좌측 Y축: 아파트 예상 매매가 (억원, 면적 기준) &nbsp;|&nbsp; 우측 Y축: 연평균 임금 (만원)</div>""", unsafe_allow_html=True)
 
         # 백테스트 실행 (최근 3년 기준)
@@ -848,7 +923,7 @@ else:
                 x=conn_fp_std_str,
                 y=conn_vp_eok,
                 name=f"예측 매매가 ({area}㎡, 억원)",
-                line=dict(color="#e94560", width=3, dash="dash"),
+                line=dict(color="rgba(233, 69, 96, 0.85)", width=2),
                 mode="lines",
                 hovertemplate="%{x|%Y년 %m월}<br>예측가: %{y:.2f}억원<extra></extra>"
             ),
@@ -874,7 +949,7 @@ else:
                 x=conn_fw_std_str,
                 y=conn_vw_manwon,
                 name="예측 연평균 임금 (만원)",
-                line=dict(color="#0f3460", width=3, dash="dash"),
+                line=dict(color="rgba(15, 52, 96, 0.85)", width=2),
                 mode="lines",
                 hovertemplate="%{x|%Y년 %m월}<br>예측임금: %{y:,.0f}만원<extra></extra>"
             ),
@@ -924,7 +999,7 @@ else:
 
         fig_dual.update_layout(
             title=dict(
-                text=f"<b>{selected_region} 아파트 가격 vs 근로소득 디커플링 예측 동향</b>",
+                text=f"<b>{selected_region} 아파트 가격 vs 근로소득 나홀로 집값 예측 동향</b>",
                 x=0.5,
                 font=dict(size=16, color="#16213e")
             ),
@@ -978,7 +1053,10 @@ else:
             _tot_vals   = [v * area for v in _sqm_vals]
             _n = (len(price_df) - 1) / 12.0
             _cagr = ((_tot_vals[-1] / _tot_vals[0]) ** (1 / _n) - 1) * 100 if _tot_vals[0] > 0 else 0
-            _pred_sqm, _, _, _, _ = forecast_poly(price_floats, _sqm_vals, target_year)
+            _pred_sqm, _, _, _, _ = forecast_poly(
+                price_floats, _sqm_vals, target_year,
+                add_cycle=use_cycle
+            )
             _pred_tot_eok = round(_pred_sqm * area / 10000, 1)
             table_data.append({
                 "분석 지역": _region,
@@ -1068,6 +1146,34 @@ else:
             apply_dark_theme(fig_income)
             st.plotly_chart(fig_income, use_container_width=True)
 
+        st.markdown('<div class="section-header">나의 자산 진단 (목표 달성 가능성)</div>', unsafe_allow_html=True)
+        
+        required_equity = r['필요자기자본_만원']
+        shortfall = required_equity - my_asset
+        progress_val = min(my_asset / required_equity, 1.0) if required_equity > 0 else 1.0
+        
+        st.progress(progress_val)
+        st.caption(f"목표 자기자본 대비 달성률: **{progress_val*100:.1f}%** ({my_asset:,}만원 / {required_equity:,}만원)")
+        
+        if shortfall > 0:
+            if my_savings > 0:
+                months_needed = shortfall / my_savings
+                years_needed = months_needed / 12
+                yrs_to_target = target_year - int(price_date_list[-1].split(".")[0])
+                
+                if years_needed <= yrs_to_target:
+                    diag_msg = f"✅ 목표 달성을 위해 **{shortfall:,}만원**이 추가로 필요합니다. 현재 저축액 유지 시 약 **{years_needed:.1f}년** 뒤 도달 가능하여 {target_year}년 내 매수가 가능할 것으로 예상됩니다!"
+                    st.success(diag_msg)
+                else:
+                    diag_msg = f"⚠️ 목표 달성을 위해 **{shortfall:,}만원**이 추가로 필요합니다. 약 **{years_needed:.1f}년**이 소요되어 {target_year}년보다 늦어집니다. 월 저축액을 늘리거나 목표 연도를 늦춰보세요."
+                    st.warning(diag_msg)
+            else:
+                diag_msg = f"⚠️ 목표 달성을 위해 **{shortfall:,}만원**이 추가로 필요합니다. 월 저축액을 입력해주세요."
+                st.warning(diag_msg)
+        else:
+            diag_msg = f"🎉 이미 필요 자기자본({required_equity:,}만원)을 달성했습니다!"
+            st.success(diag_msg)
+
         st.markdown('<div class="section-header">세대별 주택 구입 부담 지수 변화</div>', unsafe_allow_html=True)
         gen_labels = ["베이비부머 (1960년대)", "X세대 (1980년대)", "밀레니얼 (2000년대)",
                       f"Z세대 (2020년대)\n{latest_wage_date}", f"알파세대 ({target_year}년대 예측)"]
@@ -1111,7 +1217,7 @@ else:
             "과거 추세 유지 (기본)": {
                 "r": base_r, 
                 "color": "#e94560", 
-                "desc": "과거 10년간의 디커플링 추세(기본 4%)가 그대로 유지될 경우의 기준선입니다."
+                "desc": "과거 10년간의 나홀로 집값 추세(기본 4%)가 그대로 유지될 경우의 기준선입니다."
             },
             "자산 가격 침체 (비관)": {
                 "r": 0.02, 
