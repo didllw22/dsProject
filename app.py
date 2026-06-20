@@ -18,7 +18,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 st.set_page_config(
-    page_title="세대 간 자산 형성 나홀로 집값 분석",
+    page_title="나홀로 집값 분석",
     page_icon="🏙️",
     layout="wide",
     initial_sidebar_state="expanded",
