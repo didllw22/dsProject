@@ -560,7 +560,7 @@ if selected_region not in st.session_state.selected_chart_regions:
 #  헤더
 # ════════════════════════════════════════════════
 
-st.markdown('<div class="main-title">🏙️ 세대 간 자산 형성 나홀로 집값 분석</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">🏙️ 나홀로 집값 분석</div>', unsafe_allow_html=True)
 st.markdown(
     f'<div class="sub-title">근로소득과 부동산 자산의 격차 분석 및 {target_year}년 미래 적정 소득 예측 모델링 | '
     f'월별 실거래 데이터 기반 · {selected_region} · {area_str}</div>',
